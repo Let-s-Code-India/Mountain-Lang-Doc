@@ -1,0 +1,231 @@
+// mini_exchange.mtn
+// A small stock exchange written in Mountain.
+// Shows: enums, traits, generics, ownership, error handling, actors,
+// channels, an embedded database, and an async server -- in one language.
+
+use std::concurrency::channel;
+use std::net::server;
+use std::db::query;
+
+// ───────────────────────── 1. Domain types ─────────────────────────
+
+enum Side { Buy, Sell }
+
+struct Order {
+    id: u64,
+    trader: String,
+    side: Side,
+    limitPrice: f64,
+    quantity: u64,
+}
+
+struct Fill {
+    buyId: u64,
+    sellId: u64,
+    price: f64,
+    quantity: u64,
+}
+
+// ───────────────────────── 2. Errors ─────────────────────────
+
+enum TradeError {
+    InvalidPrice(f64),
+    InvalidQuantity,
+    Storage(String),
+}
+
+impl Error for TradeError {
+    fn message(borrow self) -> String {
+        match self {
+            TradeError::InvalidPrice(p) => "price must be positive, got " + p as String,
+            TradeError::InvalidQuantity => "quantity must be greater than zero",
+            TradeError::Storage(msg) => "database error: " + msg,
+        }
+    }
+    fn cause(borrow self) -> Option<borrow dyn Error> { return None; }
+}
+
+// ───────────────────────── 3. Traits + generics ─────────────────────────
+
+trait Valued {
+    fn value(borrow self) -> f64;
+
+    // default method: implementors get it for free
+    fn isLarge(borrow self) -> bool {
+        return self.value() > 1_000_000.0;
+    }
+}
+
+impl Valued for Order {
+    fn value(borrow self) -> f64 {
+        return self.limitPrice * self.quantity as f64;
+    }
+}
+
+impl Valued for Fill {
+    fn value(borrow self) -> f64 {
+        return self.price * self.quantity as f64;
+    }
+}
+
+// One generic function, works for Order, Fill, or anything Valued.
+// Monomorphized at compile time: zero dynamic dispatch.
+fn totalValue<T: Valued>(items: borrow [T]) -> f64 {
+    return items.reduce(0.0, |acc, x| acc + x.value());
+}
+
+// ───────────────────────── 4. Embedded database ─────────────────────────
+
+table Fills {
+    id: u64 primary_key auto_increment,
+    buyId: u64,
+    sellId: u64,
+    price: f64,
+    quantity: u64,
+    at: DateTime default(DateTime::now()),
+}
+
+index FillsByPrice on Fills(price);
+
+// All fills are stored atomically: either every row lands, or none do.
+fn settle(fills: borrow [Fill]) -> Result<(), TradeError> {
+    transaction {
+        for f in fills {
+            query Fills insert Fill {
+                buyId: f.buyId,
+                sellId: f.sellId,
+                price: f.price,
+                quantity: f.quantity,
+            };
+        }
+    } catch (e) {
+        return Err(TradeError::Storage(e.message()));
+    }
+    return Ok(());
+}
+
+// ───────────────────────── 5. Validation ─────────────────────────
+
+fn validate(borrow order: Order) -> Result<(), TradeError> {
+    // ensure() is always checked, in debug AND release builds
+    ensure(order.limitPrice > 0.0, TradeError::InvalidPrice(order.limitPrice))?;
+    ensure(order.quantity > 0, TradeError::InvalidQuantity)?;
+    return Ok(());
+}
+
+// ───────────────────────── 6. Matching logic ─────────────────────────
+
+// `resting` is the opposite side of the book, best price first.
+// Borrowed mutably: the borrow checker guarantees nobody else touches it.
+fn crossOrders(resting: borrow mut [Order], incoming: borrow mut Order) -> [Fill] {
+    let mut fills: [Fill] = [];
+    let mut i = 0;
+
+    while i < resting.len() && incoming.quantity > 0 {
+        let r = borrow mut resting[i];
+
+        let crosses = match incoming.side {
+            Side::Buy  => r.limitPrice <= incoming.limitPrice,
+            Side::Sell => r.limitPrice >= incoming.limitPrice,
+        };
+        if !crosses { break; }
+
+        let fillQty = if r.quantity < incoming.quantity { r.quantity } else { incoming.quantity };
+        let (buyId, sellId) = match incoming.side {
+            Side::Buy  => (incoming.id, r.id),
+            Side::Sell => (r.id, incoming.id),
+        };
+
+        fills.push(Fill { buyId: buyId, sellId: sellId, price: r.limitPrice, quantity: fillQty });
+        r.quantity -= fillQty;
+        incoming.quantity -= fillQty;
+        i += 1;
+    }
+
+    resting.retain(|o| o.quantity > 0);
+    return fills;
+}
+
+// ───────────────────────── 7. Actor: lock-free isolation ─────────────────────────
+
+// The order book lives inside an actor. Its state can only be reached by
+// sending messages, so it needs no locks at all.
+actor MatchingEngine {
+    state bids: [Order] = [];
+    state asks: [Order] = [];
+
+    on submitOrder(order: Order) {
+        let mut incoming = order;   // ownership moves into this handler
+
+        let fills = match incoming.side {
+            Side::Buy  => crossOrders(borrow mut self.asks, borrow mut incoming),
+            Side::Sell => crossOrders(borrow mut self.bids, borrow mut incoming),
+        };
+
+        if fills.len() > 0 {
+            match settle(borrow fills) {
+                Ok(_)  => print("settled " + fills.len() as String + " fills, value " + totalValue(borrow fills) as String),
+                Err(e) => eprint("settlement failed: " + e.message()),
+            }
+        }
+
+        // Whatever is left rests in the book.
+        if incoming.quantity > 0 {
+            match incoming.side {
+                Side::Buy  => self.bids.push(incoming),
+                Side::Sell => self.asks.push(incoming),
+            }
+        }
+    }
+
+    on cancelOrder(id: u64) {
+        self.bids.retain(|o| o.id != id);
+        self.asks.retain(|o| o.id != id);
+    }
+}
+
+// ───────────────────────── 8. Gateway: green threads + channel ─────────────────────────
+
+async fn main() -> Result<(), TradeError> {
+    let engine = MatchingEngine::spawn();
+    let (tx, rx) = channel::<Order>();
+
+    // Gateway task: validates every incoming order before the engine sees it.
+    // `move` transfers ownership of `rx` and `engine` into the task.
+    spawn move {
+        loop {
+            match rx.recv() {
+                Ok(order) => {
+                    match validate(borrow order) {
+                        Ok(_)  => engine.send(submitOrder(order)),
+                        Err(e) => eprint("rejected order " + order.id as String + ": " + e.message()),
+                    }
+                },
+                Err(_) => break,   // channel closed
+            }
+        }
+    };
+
+    // Seed the book with a few orders.
+    tx.send(Order { id: 1, trader: "asha",  side: Side::Sell, limitPrice: 101.50, quantity: 200 });
+    tx.send(Order { id: 2, trader: "ravi",  side: Side::Sell, limitPrice: 102.00, quantity: 300 });
+    tx.send(Order { id: 3, trader: "meera", side: Side::Buy,  limitPrice: 102.00, quantity: 350 });
+    tx.send(Order { id: 4, trader: "dev",   side: Side::Buy,  limitPrice: -5.0,   quantity: 10  });  // rejected
+
+    // Read-only HTTP endpoint: total traded value straight from the database.
+    let srv = server::Http::bind("0.0.0.0:8080")?;
+    srv.onRequest(|req| {
+        match req.path.as_str() {
+            "/volume" => {
+                let all: [Fill] = query Fills orderBy price;
+                return HttpResponse::json("{ \"fills\": " + all.len() as String
+                    + ", \"value\": " + totalValue(borrow all) as String + " }");
+            },
+            _ => return HttpResponse::notFound(),
+        }
+    });
+
+    print("Mini exchange running on port 8080");
+    await srv.listen();
+    return Ok(());
+}
